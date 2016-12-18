@@ -10,9 +10,13 @@ type ClusterSerializer{I<:IO} <: AbstractSerializer
     counter::Int
     table::ObjectIdDict
 
+    pid::Int                  # Worker we are connected to.
     sent_objects::Set{UInt64} # used by serialize (track objects sent)
+    sent_globals::Dict
 
-    ClusterSerializer(io::I) = new(io, 0, ObjectIdDict(), Set{UInt64}())
+    ClusterSerializer(io::I) = new(io, 0, ObjectIdDict(),
+                                Base.worker_id_from_socket(io),
+                                Set{UInt64}(), Dict())
 end
 ClusterSerializer(io::IO) = ClusterSerializer{typeof(io)}(io)
 
@@ -49,65 +53,58 @@ function serialize(s::ClusterSerializer, t::TypeName)
 end
 
 const FLG_SER_VAL = UInt8(1)
-const FLG_SER_IDENT = UInt8(2)
-const FLG_ISCONST_VAL = UInt8(4)
+const FLG_ISCONST_VAL = UInt8(2)
 isflagged(v, flg) = (v & flg == flg)
+
+# We will send/resend a global object if
+# a) has not been sent previously, i.e., we are seeing this object_id for the
+#    for the first time, or,
+# b) hash value has changed
 
 function serialize_global_from_main(s::ClusterSerializer, g::GlobalRef)
     v = getfield(Main, g.name)
-    # println(g)
+    println(g)
 
     serialize(s, g.name)
 
     flags = UInt8(0)
     if isbits(v)
-        identifier = 0
         flags = flags | FLG_SER_VAL
     else
-        identifier = object_number(v)
-        if !(identifier in s.sent_objects)
-            # println("Object ", v, ", has NOT been sent previously. identifier:", identifier)
-            flags = flags | FLG_SER_VAL
-        end
-        flags = flags | FLG_SER_IDENT
-    end
+        oid = object_id(v)
+        if haskey(s.sent_globals, oid)
+            # We have sent this object before, see if it has changed.
+            prev_hash = s.sent_globals[oid]
+            new_hash = hash(v)
+            if new_hash != prev_hash
+                flags = flags | FLG_SER_VAL
+                s.sent_globals[oid] = new_hash
 
-    if isconst(Main, g.name)
-        flags = flags | FLG_ISCONST_VAL
+                # No need to setup a new finalizer as only the hash
+                # value and not the object itself has changed.
+            end
+        else
+            flags = flags | FLG_SER_VAL
+            try
+                finalizer(v, x->delete_global_tracker(s,x))
+                s.sent_globals[oid] = hash(v)
+            catch ex
+                # Do not track objects that cannot be finalized.
+            end
+        end
     end
+    isconst(Main, g.name) && (flags = flags | FLG_ISCONST_VAL)
 
     write(s.io, flags)
-
-    identifier != 0 && write(s.io, identifier)
-    if isflagged(flags, FLG_SER_VAL)
-        serialize(s, v)
-    end
-
-    if identifier > 0
-        push!(s.sent_objects, identifier)
-        finalizer(v, x->release_globals_refs(s,x))
-    end
+    isflagged(flags, FLG_SER_VAL) && serialize(s, v)
 end
 
 function deserialize_global_from_main(s::ClusterSerializer)
     sym = deserialize(s)::Symbol
     flags = read(s.io, UInt8)
 
-    identifier = 0
-    if isflagged(flags, FLG_SER_IDENT)
-        identifier = read(s.io, UInt64)
-    end
-
     if isflagged(flags, FLG_SER_VAL)
         v = deserialize(s)
-    else
-        @assert identifier > 0
-        v = get(known_object_data, identifier, nothing)
-    end
-
-    if !isbits(v) && !haskey(object_numbers, v)
-        # set up reverse mapping for serialize
-        object_numbers[v] = identifier
     end
 
     # create/update binding under Main only if the value has been sent
@@ -122,10 +119,12 @@ function deserialize_global_from_main(s::ClusterSerializer)
     return GlobalRef(Main, sym)
 end
 
-function release_globals_refs(s::ClusterSerializer, v)
-    # TODO Run through the send objects list and delete from all nodes by setting
-    # the global binding to `nothing`. Also remove from sent_objects
+function delete_global_tracker(s::ClusterSerializer, v)
+    oid = object_id(v)
+    if haskey(s.sent_globals, oid)
+        delete!(s.sent_globals, oid)
+    end
 
-    # println("Released ", v)
+    # TODO: Should release memory from the remote nodes.
 end
 
